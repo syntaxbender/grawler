@@ -1,165 +1,296 @@
-from fake_useragent import UserAgent
 import asyncio
 import aiohttp
+import random
 import sqlite3
 import json
-import sys
-from playwright.async_api import async_playwright
-from bs4 import BeautifulSoup
-from waybackpy import WaybackMachineCDXServerAPI
 import os
+import logging
+import re
+import socket
+from urllib.parse import urlparse, urlunparse
+from fake_useragent import UserAgent
+from playwright.async_api import async_playwright
+from waybackpy import WaybackMachineCDXServerAPI, exceptions
+from bs4 import BeautifulSoup
+import sys
+from colorama import just_fix_windows_console
+from colorama import Fore, Back, Style
+from colorama import init
+from ssl import SSLCertVerificationError
 
+init(autoreset=True)
+just_fix_windows_console()
+
+# Windows için özel event loop ayarı
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
+# Yapılandırma
 DB_FILE = "crawled_data.db"
-HEADERS = {"User-Agent": "Mozilla/5.0"}
-MAX_CONCURRENT_REQUESTS = 50  # Sınırlı eşzamanlı istek
-columns, rows = os.get_terminal_size()
+MAX_CONCURRENT_REQUESTS = 15
+REQUEST_TIMEOUT = 120
+RETRY_ATTEMPTS = 3
+WAIT_TIMES = [1, 3, 5]
+SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
-semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)  # Eşzamanlı istekleri sınırla
+# Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("crawler.log"),
+        logging.StreamHandler()
+    ]
+)
 
-ua = UserAgent()
+class RetryableError(Exception):
+    pass
 
-def log(message, color="white"):
-    """Renkli log çıktısı"""
-    colors = {
-        "red": "\033[91m",
-        "green": "\033[92m",
-        "yellow": "\033[93m",
-        "blue": "\033[94m",
-        "white": "\033[97m"
-    }
-    reset = "\033[0m"
-    print(f"{colors.get(color, colors['white'])}[LOG] {message}{reset}")
+class Crawler:
+    def __init__(self):
+        self.ua = UserAgent()
+        self.user_agents = [
+            self.ua.chrome,
+            self.ua.firefox,
+            self.ua.safari,
+            self.ua.random
+        ]
+        
+        # Özel header'lar
+        self.special_headers = {
+            "www.wordfence.com": {
+                "Referer": "https://www.wordfence.com/",
+                "X-Forwarded-For": f"{random.randint(1,255)}.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(0,255)}"
+            }
+        }
 
-def init_db():
-    """Veritabanını başlatır."""
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS crawled_data (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                cve_id TEXT,
-                url TEXT,
-                html TEXT
-            )"""
+    async def initialize(self):
+        """Playwright ve veritabanını başlat"""
+        self.conn = sqlite3.connect(DB_FILE)
+        self._init_db()
+        
+        # Playwright'ı başlat
+        self.playwright = await async_playwright().start()
+        
+        self.browser = await self.playwright.chromium.launch(
+            headless=True,  # Headless modu kapat
+            args=["--disable-blink-features=AutomationControlled"]
         )
-        conn.commit()
+        logging.info("Playwright and browser initialized successfully.")
 
-async def fetch_html(browser, url):
-    """JavaScript içeren sayfalar için Playwright ile HTML getirir."""
-    try:
-        page = await browser.new_page()
-        response = await page.goto(url, timeout=30000)
-        
-        if response and response.status == 202:
-            log(f"HTTP 202 tespit edildi! Bekleniyor... {url}", "yellow")
-            await page.wait_for_timeout(3000)  # 3 saniye bekle
-            redirected_url = page.url  # Yeni yönlendirilen URL'yi al
-            log("✓" * columns, "yellow")
-            log(f"Yönlendirilen yeni URL: {redirected_url}", "white")
-            log("✓" * columns, "yellow")
-            await page.goto(redirected_url, timeout=30000)  # Yeni sayfayı aç
-        
-        content = await page.content()
-        await page.close()
-        log(f"Fetched JS content from {url}")
-        return content
-    except Exception as e:
-        log(f"Failed to fetch JS content from {url}: {e}", "red")
-        return None
+    def _init_db(self):
+        """Veritabanını başlat"""
+        with self.conn:
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS crawled_data (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cve_id TEXT,
+                    url TEXT UNIQUE,
+                    html TEXT,
+                    source TEXT,
+                    status_code INTEGER,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )""")
 
-async def fetch_static_html(session, url):
-    """JavaScript içermeyen sayfalar için aiohttp ile HTML getirir."""
-    async with semaphore:  # Eşzamanlı istekleri kontrol et
+    async def _sanitize_url(self, url):
+        """URL normalizasyonu"""
+        # Çift scheme temizleme
+        url = re.sub(r"^(https?://)(https?://)", r"\1", url)
+        parsed = urlparse(url)
+        if not parsed.scheme:
+            url = f"http://{url}"
+            parsed = urlparse(url)
+        return urlunparse((
+            parsed.scheme,
+            parsed.netloc.lower(),
+            parsed.path.rstrip('/'),
+            parsed.params,
+            parsed.query,
+            parsed.fragment
+        ))
+
+    async def _handle_202(self, page):
+        """HTTP 202 durumunda bekleyip yönlendirme sonrası sayfayı kaydetme"""
+        logging.info(f"{Fore.CYAN}[HTTP 202] {Style.RESET_ALL}Handling challenge...: {page.url}")
+        await page.wait_for_timeout(5000)
+        await page.reload(wait_until="networkidle")
+        logging.info(f"{Fore.YELLOW}[HTTP 202] {Style.RESET_ALL}Redirected URL: {page.url}")
+        return await page.content()
+
+    async def fetch_aiohttp(self, session, url, ssl=True):
+        headers = {
+            "User-Agent": random.choice(self.user_agents),
+            **self.special_headers.get(urlparse(url).netloc, {})
+        }
         try:
-            async with session.get(url, headers=HEADERS, timeout=30, ssl=False) as resp:
-                if resp.status == 200:
-                    content_type = resp.headers.get("Content-Type", "")
+            async with session.get(url, headers=headers, ssl=ssl,
+                                   timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)) as resp:
+                if resp.status == 202:
+                    logging.info(f"{Fore.BLUE}[HTTP 202 - Needs browser handling] {Style.RESET_ALL}: {url}")
+                    # 202 durumunda, playwright ile yeniden dene
+                    return await self.fetch_playwright(url)
                     
-                    # Eğer içerik PDF ise kaydet ve işleme alma
-                    if "application/pdf" in content_type:
-                        log(f"PDF dosyası bulundu, kaydediliyor: {url}", "blue")
-                        pdf_content = await resp.read()
-                        filename = url.split("/")[-1]
-                        with open(filename, "wb") as f:
-                            f.write(pdf_content)
-                        return None  # PDF içeriği HTML gibi işlenmesin
-                    
-                    log(f"Fetched static HTML from {url}", "green")
-                    return await resp.text()
-                
-                elif resp.status in [403, 503]:
-                    log(f"Site botları engelliyor. Playwright denenecek: {url}", "yellow")
-                    return None  # Playwright ile denenecek
-                
+                # İçerik türünü kontrol et
+                content_type = resp.headers.get("Content-Type", "")
+                if "application/pdf" in content_type or "image" in content_type:
+                    content = await resp.read()
                 else:
-                    log(f"Failed to fetch static HTML from {url}: HTTP {resp.status}", "red")
-                    return None
+                    content = await resp.text(encoding="utf-8", errors="replace")
+                return {
+                    "content": content,
+                    "status": resp.status,
+                    "source": "aiohttp"
+                }
+        except SSLCertVerificationError:
+            logging.warning(f"{Fore.CYAN}[Try: SSL -> FALSE] {Style.RESET_ALL}: {url}")
+            return await self.fetch_aiohttp(session, url, ssl=False)
         except Exception as e:
-            log(f"Error fetching static HTML from {url}: {e}", "red")
-        return None
+            logging.error(f"{Fore.RED}[aiohttp error] {Style.RESET_ALL}: {str(e)}")
+            return None
 
+    async def fetch_playwright(self, url):
+        """Playwright ile içerik çekme"""
+        context = await self.browser.new_context(
+            user_agent=random.choice(self.user_agents),
+            viewport={"width": 1920, "height": 1080},
+            locale="en-US",
+            bypass_csp=True,
+            ignore_https_errors=True
+        )
+        try:
+            page = await context.new_page()
+            # Tracker engelleme
+            await page.route("**/*", lambda route: route.abort() 
+                if route.request.resource_type in {"image", "stylesheet", "font"} 
+                else route.continue_()
+            )
+            response = await page.goto(url, wait_until="networkidle", timeout=90000)
+            if response.status == 202:
+                content = await self._handle_202(page)
+            else:
+                content = await page.content()
+            return {
+                "content": content,
+                "status": response.status,
+                "source": "playwright"
+            }
+        except Exception as e:
+            logging.error(f"{Fore.RED}[Playwright error] {Style.RESET_ALL}: {str(e)}")
+            return None
+        finally:
+            await context.close()
 
-async def recover_from_wayback(url):
-    """Wayback Machine’den veri alır."""
-    try:
-        cdx = WaybackMachineCDXServerAPI(url)
-        snapshots = cdx.snapshots()
-        if snapshots:
-            latest_snapshot = snapshots[-1]["url"]
-            async with aiohttp.ClientSession() as session:
-                content = await fetch_static_html(session, latest_snapshot)
-                if content:
-                    log(f"Recovered content from Wayback Machine for {url}", "green")
-                return content
-    except Exception as e:
-        log(f"Failed to recover from Wayback Machine for {url}: {e}", "red")
-        return None
+    async def fetch_wayback(self, url):
+        """Wayback Machine'den içerik alma"""
+        try:
+            cdx = WaybackMachineCDXServerAPI(
+                url,
+                user_agent=random.choice(self.user_agents),
+                start_timestamp="20200101",
+                end_timestamp="20241231",
+                collapses=["timestamp:6"]
+            )
+            snapshots = list(cdx.snapshots())
+            if not snapshots:
+                return None
+            for snapshot in reversed(snapshots):
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(snapshot.archive_url, timeout=REQUEST_TIMEOUT) as resp:
+                        if resp.status == 200:
+                            content = await resp.text()
+                            if "This page is not available" not in content:
+                                return {
+                                    "content": content,
+                                    "status": 200,
+                                    "source": "wayback"
+                                }
+            return None
+        except exceptions.NoCDXRecordFound:
+            return None
+        except Exception as e:
+            logging.error(f"{Fore.RED}[Wayback error] {Style.RESET_ALL}: {str(e)}")
+            return None
 
-async def process_url(session, browser, cve_id, url):
-    """Tek bir URL işleyerek HTML verisini alır ve kaydeder."""
-    html = await fetch_static_html(session, url)
-    
-    if not html:
-        html = await fetch_html(browser, url)  # Playwright ile dene
-    
-    if not html:
-        html = await recover_from_wayback(url)  # Wayback Machine'den al
+    async def process_url(self, session, cve_id, url):
+        """URL işleme ana mantığı"""
+        try:
+            clean_url = await self._sanitize_url(url)
+            result = None
+            sources = [
+                ("aiohttp", lambda: self.fetch_aiohttp(session, clean_url)),
+                ("playwright", lambda: self.fetch_playwright(clean_url)),
+                ("wayback", lambda: self.fetch_wayback(clean_url))
+            ]
+            for source_name, fetcher in sources:
+                for attempt in range(RETRY_ATTEMPTS):
+                    try:
+                        async with SEMAPHORE:
+                            result = await fetcher()
+                            if result and result["content"]:
+                                break
+                            await asyncio.sleep(WAIT_TIMES[attempt])
+                    except RetryableError as e:
+                        logging.warning(f"{Fore.YELLOW}[Retrying] {Style.RESET_ALL}{source_name}: {str(e)}")
+                        continue
+                if result:
+                    break
+            if result:
+                await self._save_result(cve_id, clean_url, result)
+            else:
+                logging.error(f"All sources failed: {clean_url}")
+        except Exception as e:
+            logging.error(f"Critical error: {str(e)}")
 
-    if html:
-        save_to_db(cve_id, url, html)
-    else:
-        log(f"No content available for {url}", "red")
+    async def _save_result(self, cve_id, url, result):
+        """Sonucu veritabanına kaydet"""
+        try:
+            with self.conn:
+                self.conn.execute(
+                    """INSERT INTO crawled_data 
+                    (cve_id, url, html, source, status_code)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(url) DO UPDATE SET
+                        html=excluded.html,
+                        source=excluded.source,
+                        status_code=excluded.status_code""",
+                    (cve_id, url, result["content"], result["source"], result["status"])
+                )
+            logging.info(f"{Fore.GREEN}[+] {Style.RESET_ALL}Saved: {url}")
+        except Exception as e:
+            logging.error(f"DB error: {str(e)}")
 
-async def process_batch(cve_data):
-    """Tüm URL'leri asenkron şekilde işler."""
-    async with aiohttp.ClientSession() as session:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            
-            tasks = [process_url(session, browser, item['cve_id'], url) 
-                     for item in cve_data for url in item['urls']]
+    async def run(self, dataset_path):
+        """Ana çalıştırıcı"""
+        with open(dataset_path) as f:
+            cve_data = json.load(f)
+        connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT_REQUESTS)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            tasks = []
+            for entry in cve_data:
+                for url in entry['urls']:
+                    tasks.append(
+                        self.process_url(session, entry['cve_id'], url)
+                    )
             await asyncio.gather(*tasks)
-            
-            await browser.close()
+        await self.browser.close()
+        await self.playwright.stop()
+        self.conn.close()
 
-def save_to_db(cve_id, url, html):
-    """Veriyi SQLite veritabanına kaydeder."""
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("INSERT INTO crawled_data (cve_id, url, html) VALUES (?, ?, ?)", (cve_id, url, html))
-        conn.commit()
-        log(f"Saved {url} to database", "blue")
+    async def close(self):
+        """Kaynakları kapat"""
+        await self.browser.close()
+        await self.playwright.stop()
+        self.conn.close()
+
+async def main():
+    crawler = Crawler()
+    try:
+        await crawler.initialize()
+        await crawler.run("..\\dataset.json")
+    except Exception as e:
+        logging.error(f"An error occurred: {str(e)}")
+    finally:
+        await crawler.close()
 
 if __name__ == "__main__":
-    log("Initializing database...", "blue")
-    init_db()
-    log("Starting URL processing...", "blue")
-    
-    with open("..\\dataset.json", "r") as file:
-        HEADERS = {"User-Agent": ua.random}
-        columns, rows = os.get_terminal_size()
-        cve_data = json.load(file)
-
-    asyncio.run(process_batch(cve_data))
-
-    log("Processing complete!", "green")
+    asyncio.run(main())
