@@ -1,3 +1,4 @@
+from fake_useragent import UserAgent
 import asyncio
 import aiohttp
 import sqlite3
@@ -15,6 +16,7 @@ columns, rows = os.get_terminal_size()
 
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)  # Eşzamanlı istekleri sınırla
 
+ua = UserAgent()
 
 def log(message, color="white"):
     """Renkli log çıktısı"""
@@ -42,10 +44,11 @@ def init_db():
         )
         conn.commit()
 
-async def fetch_html(page, url):
+async def fetch_html(browser, url):
     """JavaScript içeren sayfalar için Playwright ile HTML getirir."""
     try:
-        response = await page.goto(url, timeout=15000)
+        page = await browser.new_page()
+        response = await page.goto(url, timeout=30000)
         
         if response and response.status == 202:
             log(f"HTTP 202 tespit edildi! Bekleniyor... {url}", "yellow")
@@ -54,9 +57,10 @@ async def fetch_html(page, url):
             log("✓" * columns, "yellow")
             log(f"Yönlendirilen yeni URL: {redirected_url}", "white")
             log("✓" * columns, "yellow")
-            await page.goto(redirected_url, timeout=15000)  # Yeni sayfayı aç
+            await page.goto(redirected_url, timeout=30000)  # Yeni sayfayı aç
         
         content = await page.content()
+        await page.close()
         log(f"Fetched JS content from {url}")
         return content
     except Exception as e:
@@ -67,19 +71,33 @@ async def fetch_static_html(session, url):
     """JavaScript içermeyen sayfalar için aiohttp ile HTML getirir."""
     async with semaphore:  # Eşzamanlı istekleri kontrol et
         try:
-            async with session.get(url, headers=HEADERS, timeout=10) as resp:
+            async with session.get(url, headers=HEADERS, timeout=30, ssl=False) as resp:
                 if resp.status == 200:
+                    content_type = resp.headers.get("Content-Type", "")
+                    
+                    # Eğer içerik PDF ise kaydet ve işleme alma
+                    if "application/pdf" in content_type:
+                        log(f"PDF dosyası bulundu, kaydediliyor: {url}", "blue")
+                        pdf_content = await resp.read()
+                        filename = url.split("/")[-1]
+                        with open(filename, "wb") as f:
+                            f.write(pdf_content)
+                        return None  # PDF içeriği HTML gibi işlenmesin
+                    
                     log(f"Fetched static HTML from {url}", "green")
                     return await resp.text()
-                elif resp.status == 202:
-                    log(f"HTTP 202 alındı! Playwright ile işlenmeli: {url}", "yellow")
-                    return None  # Playwright ile işlenecek
+                
+                elif resp.status in [403, 503]:
+                    log(f"Site botları engelliyor. Playwright denenecek: {url}", "yellow")
+                    return None  # Playwright ile denenecek
+                
                 else:
                     log(f"Failed to fetch static HTML from {url}: HTTP {resp.status}", "red")
                     return None
         except Exception as e:
             log(f"Error fetching static HTML from {url}: {e}", "red")
-            return None
+        return None
+
 
 async def recover_from_wayback(url):
     """Wayback Machine’den veri alır."""
@@ -97,12 +115,12 @@ async def recover_from_wayback(url):
         log(f"Failed to recover from Wayback Machine for {url}: {e}", "red")
         return None
 
-async def process_url(session, page, cve_id, url):
+async def process_url(session, browser, cve_id, url):
     """Tek bir URL işleyerek HTML verisini alır ve kaydeder."""
     html = await fetch_static_html(session, url)
     
     if not html:
-        html = await fetch_html(page, url)  # Playwright ile dene
+        html = await fetch_html(browser, url)  # Playwright ile dene
     
     if not html:
         html = await recover_from_wayback(url)  # Wayback Machine'den al
@@ -117,9 +135,8 @@ async def process_batch(cve_data):
     async with aiohttp.ClientSession() as session:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
             
-            tasks = [process_url(session, page, item['cve_id'], url) 
+            tasks = [process_url(session, browser, item['cve_id'], url) 
                      for item in cve_data for url in item['urls']]
             await asyncio.gather(*tasks)
             
@@ -139,6 +156,7 @@ if __name__ == "__main__":
     log("Starting URL processing...", "blue")
     
     with open("..\\dataset.json", "r") as file:
+        HEADERS = {"User-Agent": ua.random}
         columns, rows = os.get_terminal_size()
         cve_data = json.load(file)
 
