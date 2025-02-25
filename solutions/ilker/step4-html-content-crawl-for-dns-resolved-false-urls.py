@@ -1,8 +1,7 @@
 import psycopg2
 import requests
-from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
-import time  # time modülünü ekliyoruz
+import time
 
 
 # PostgreSQL bağlantısını kurma
@@ -21,26 +20,17 @@ def check_wayback_availability(url):
 
     try:
         response = requests.get(wayback_api_url)
-        response.raise_for_status()  # Hata kontrolü yapar
+        response.raise_for_status()
         data = response.json()
 
         if "archived_snapshots" in data and "closest" in data["archived_snapshots"]:
             snapshots = data["archived_snapshots"]
             if snapshots:
-                # SnapShotları tarihe göre sıralayıp en eskiyi seçelim
                 sorted_snapshots = sorted(snapshots.values(), key=lambda x: x['timestamp'])
-                first_snapshot = sorted_snapshots[0]  # En eski snapshot
+                first_snapshot = sorted_snapshots[0]
                 if first_snapshot["available"]:
-                    return first_snapshot["url"]  # Arşivlenmiş içerik varsa URL'yi döndürür
-                else:
-                    print(f"No archived content found for {url}")
-                    return None
-            else:
-                print(f"No archived content found for {url}")
-                return None
-        else:
-            print(f"No archived content found for {url}")
-            return None
+                    return first_snapshot["url"]
+        return None
     except requests.exceptions.RequestException as e:
         print(f"Error checking Wayback availability for {url}: {e}")
         return None
@@ -51,15 +41,12 @@ def fetch_wayback_html(url):
     archived_url = check_wayback_availability(url)
     if archived_url:
         try:
-            # Arşivlenmiş URL'yi kullanarak HTML içeriğini alıyoruz
             response = requests.get(archived_url)
-            response.raise_for_status()  # Hata kontrolü yapar
-            return response.text  # HTML içeriği döndürüyoruz
+            response.raise_for_status()
+            return response.text
         except requests.exceptions.RequestException as e:
             print(f"Error fetching content from Wayback Machine: {e}")
-            return None
-    else:
-        return None
+    return None
 
 
 # Veritabanına HTML içeriğini kaydetme
@@ -68,11 +55,10 @@ def update_db_with_html(url, html_content):
     cursor = conn.cursor()
 
     try:
-        # HTML içeriğini ve durumu güncelleme
         cursor.execute("""
-            UPDATE cve_entries
+            UPDATE unique_cve_entries_domain_resolved_false
             SET html_content = %s, status = 'success'
-            WHERE url = %s AND domain_resolved = false
+            WHERE url = %s
         """, (html_content, url))
         conn.commit()
     except Exception as e:
@@ -87,7 +73,6 @@ def process_url(url):
     print(f"Processing {url}")
     html_content = fetch_wayback_html(url)
     if html_content:
-        # HTML içeriğini veritabanına kaydet
         update_db_with_html(url, html_content)
     else:
         print(f"No content found for {url}")
@@ -99,29 +84,24 @@ def main():
     cursor = conn.cursor()
 
     try:
-        # domain_resolved false olan ve unique URL'leri seç
+        # Sadece html_content IS NULL olan kayıtları al
         cursor.execute("""
-            SELECT DISTINCT url FROM cve_entries
-            WHERE domain_resolved = false
-              AND url NOT LIKE 'file://%'  -- 'file' ile başlayanları filtrele
-              AND url NOT LIKE 'ftp://%'   -- 'ftp' ile başlayanları filtrele
+            SELECT url FROM unique_cve_entries_domain_resolved_false
+            WHERE html_content IS NULL
+              AND url NOT LIKE 'file://%'
+              AND url NOT LIKE 'ftp://%'
         """)
         rows = cursor.fetchall()
 
-        total_urls = len(rows)  # Toplam URL sayısını al
+        total_urls = len(rows)
         print(f"Total {total_urls} URLs to process")
 
-        # Paralel işlem için ThreadPoolExecutor kullanma
-        with ThreadPoolExecutor(max_workers=2) as executor:
+        with ThreadPoolExecutor(max_workers=3) as executor:
             for index, row in enumerate(rows, start=1):
                 url = row[0]
-                # İlerleme yazdırma
                 print(f"Processing {index}/{total_urls} - {url}")
-                # URL'yi paralel olarak işleme
                 executor.submit(process_url, url)
-
-                # Rate limit için bekleme
-                time.sleep(1)  # Her istek arasında 1 saniye bekleme
+                time.sleep(1)  # Rate limit için bekleme
 
     except Exception as e:
         print(f"Error fetching data from the database: {e}")
