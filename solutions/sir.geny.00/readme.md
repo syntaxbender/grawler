@@ -5,3 +5,4 @@
 - proxy desteği
 - gerekirse cf caphta bypass
 - queue yerine mutex lock barındırmayan data sharding yapılan bir mimari
+- ThreadPoolExecutor deneyebilirim
